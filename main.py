@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ CACHE_EXPIRE_SECONDS = int(os.getenv("CACHE_EXPIRE_SECONDS", 43200))
 
 # --- OpenAI 配置 ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 
 # 全局 OpenAI 客户端
@@ -87,7 +88,7 @@ async def lifespan(app: FastAPI):
 
     # 初始化 OpenAI 客户端
     if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY not found in environment variables. The /interpret endpoint will not work.")
+        logger.warning("OPENAI_API_KEY not found. The report generation endpoint will not work.")
     else:
         openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
         logger.info(f"OpenAI client initialized for model: {OPENAI_MODEL_NAME}")
@@ -101,56 +102,27 @@ async def lifespan(app: FastAPI):
 
 # --- 4. FastAPI 应用实例 ---
 app = FastAPI(
-    title="Hugging Face Daily Papers Scraper & Interpreter",
-    description="一个API服务，用于爬取Hugging Face每日论文并使用LLM进行解读。",
-    version="3.0.0",
+    title="AI每日论文解读服务",
+    description="一个API服务，用于一键爬取Hugging Face每日论文并生成LLM中文解读报告。",
+    version="4.0.0-final",
     lifespan=lifespan
 )
 
+# --- 5. 核心逻辑函数 (解耦&可复用) ---
 
-# --- 5. 辅助函数 ---
-def get_author_names(authors_list: list) -> List[str]:
-    """从作者对象列表中安全地提取作者姓名"""
-    names = []
-    if not isinstance(authors_list, list):
-        return names
-    for author in authors_list:
-        if isinstance(author, dict) and author.get("name"):
-            names.append(author["name"])
-    return names
-
-
-# --- 6. API 端点 ---
-@app.get(
-    "/papers",
-    response_model=List[Paper],
-    summary="获取指定日期的Hugging Face论文",
-    description="默认获取当天论文。结果会被缓存以提高性能。日期格式: YYYY-MM-DD。"
-)
+# 将缓存装饰器应用在核心爬虫函数上
 @cache(expire=CACHE_EXPIRE_SECONDS)
-async def get_daily_papers(request_date: Optional[str] = None):
+async def scrape_papers_for_date(date_str: str) -> List[Paper]:
     """
-    爬取 Hugging Face Daily Papers。此函数的执行结果将被缓存。
+    爬取指定日期的论文数据。此函数的结果将被缓存。
     """
-    if request_date:
-        try:
-            target_date = date.fromisoformat(request_date)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="日期格式无效，请使用 'YYYY-MM-DD' 格式。")
-    else:
-        target_date = date.today()
-
-    date_str = target_date.isoformat()
     url = f"https://huggingface.co/papers/date/{date_str}"
-
-    logger.info(f"开始为日期 {date_str} 获取论文，请求URL: {url}")
-    logger.info("缓存未命中，正在执行实时爬取。")
-
+    logger.info(f"缓存未命中，开始为日期 {date_str} 实时爬取论文: {url}")
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36", 
+        "Accept-Language": "en-US,en;q=0.9"
     }
-
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, headers=headers, timeout=20.0, follow_redirects=True)
@@ -161,36 +133,33 @@ async def get_daily_papers(request_date: Optional[str] = None):
     except httpx.HTTPStatusError as exc:
         logger.error(f"Hugging Face服务器返回错误状态 {exc.response.status_code} for URL {url}")
         if exc.response.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"未找到日期 {date_str} 的论文页面。")
-        else:
-            raise HTTPException(status_code=exc.response.status_code, detail=f"Hugging Face服务器返回错误: {exc.response.text}")
+            # 对于爬虫函数，返回空列表比抛出HTTP异常更通用
+            return []
+        raise HTTPException(status_code=exc.response.status_code, detail=f"Hugging Face服务器返回错误: {exc.response.text}")
 
     logger.info(f"成功获取页面内容，开始解析HTML...")
 
     soup = BeautifulSoup(response.text, 'lxml')
     data_div = soup.find('div', attrs={'data-target': 'DailyPapers'})
-
     if not data_div or 'data-props' not in data_div.attrs:
-        logger.warning(f"在页面 {url} 上未找到 'DailyPapers' 数据块。可能当天没有论文或页面结构已更改。")
+        logger.warning(f"在页面 {url} 上未找到 'DailyPapers' 数据块。")
         return []
-
+        
     try:
         props_data = json.loads(data_div['data-props'])
-        papers_list = props_data.get('dailyPapers', [])
+        papers_list_json = props_data.get('dailyPapers', [])
     except (json.JSONDecodeError, KeyError) as e:
         logger.exception("解析页面内嵌JSON数据时发生严重错误。")
         raise HTTPException(status_code=500, detail=f"解析页面内嵌JSON数据失败: {e}")
 
     results: List[Paper] = []
-    for item in papers_list:
+    for item in papers_list_json:
         paper_data = item.get('paper', {})
         paper_id = paper_data.get('id')
         title = paper_data.get('title')
-
         if not paper_id or not title:
             logger.warning(f"跳过一条不完整的论文记录: {item}")
             continue
-
         try:
             cleaned_title = ' '.join(title.split())
             cleaned_summary = ' '.join(paper_data.get('summary', '').split())
@@ -200,7 +169,7 @@ async def get_daily_papers(request_date: Optional[str] = None):
                 summary=cleaned_summary,
                 arxiv_url=f"https://arxiv.org/abs/{paper_id}",
                 huggingface_url=f"https://huggingface.co/papers/{paper_id}",
-                authors=get_author_names(paper_data.get("authors", [])),
+                authors=[author.get("name") for author in paper_data.get("authors", []) if author.get("name")],
                 github_url=paper_data.get("githubRepo"),
                 upvotes=paper_data.get("upvotes", 0),
                 ai_summary=paper_data.get("ai_summary"),
@@ -210,51 +179,96 @@ async def get_daily_papers(request_date: Optional[str] = None):
         except Exception as e:
             logger.error(f"处理论文 {paper_id} 时出错: {e}. Raw data: {paper_data}")
             continue
-
+    
     logger.info(f"成功解析并处理了 {len(results)} 篇论文（日期: {date_str}）。")
     return results
 
 
-@app.post("/interpret", response_model=MarkdownResponse, summary="[步骤2] 对论文列表进行LLM解读并生成报告")
-async def interpret_papers(
-    paper_list: PaperList,
-    max_papers: int = Query(3, ge=1, le=10, description="要解读的论文最大数量，按点赞数排序。")
+async def interpret_single_paper(paper: Paper) -> str:
+    """使用LLM解读单篇论文"""
+    if not openai_client: return "错误：OpenAI客户端未配置。"
+    prompt = PROMPT_TEMPLATE.format(title=paper.title, summary=paper.summary)
+    try:
+        response = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL_NAME, 
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3, 
+            max_tokens=8000)
+        return response.choices[0].message.content or paper.summary
+    except OpenAIError as e:
+        logger.error(f"调用OpenAI API失败，论文标题: '{paper.title}': {e}")
+        return f"错误：无法从LLM获取解读结果。详情: {e}"
+    except Exception as e:
+        logger.error(f"解读论文时发生未知错误，论文标题: '{paper.title}': {e}")
+        return "错误：发生未知错误。"
+
+# --- 6. API 端点 ---
+@app.get(
+    "/daily_report",
+    response_model=MarkdownResponse,
+    summary="一键获取并解读每日热门论文"
+)
+async def get_daily_report(
+    request_date: Optional[str] = Query(None, description="要获取报告的日期 (YYYY-MM-DD)，留空则为今天。"),
+    max_papers: int = Query(3, ge=1, le=10, description="解读论文的最大数量，按点赞数排序。")
 ):
     """
-    接收一个论文列表，对其进行排序、筛选，并调用LLM进行解读，最后生成一份Markdown报告。
+    使用大语言模型进行中文解读，并返回一份完整的Markdown报告。
     """
     if not openai_client:
-        raise HTTPException(status_code=503, detail="OpenAI客户端未配置，无法提供解读服务。请检查服务器配置。")
-        
-    papers = paper_list.papers
-    if not papers:
-        return MarkdownResponse(markdown_report="# Daily Paper Report\n\nNo papers provided to interpret.")
+        raise HTTPException(status_code=503, detail="OpenAI客户端未配置，无法提供解读服务。")
 
-    # 1. 按点赞数排序并筛选
+    target_date = date.today()
+    if request_date:
+        try:
+            target_date = date.fromisoformat(request_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式无效，请使用 'YYYY-MM-DD' 格式。")
+    date_str = target_date.isoformat()
+
+    # 1. 获取论文数据 (此步骤会被缓存)
+    papers = await scrape_papers_for_date(date_str)
+    if not papers:
+        return MarkdownResponse(markdown_report=f"# AI每日论文解读 ({date_str})\n\n今天没有找到可以解读的论文。")
+
+    # 2. 排序和筛选
     sorted_papers = sorted(papers, key=lambda p: p.upvotes, reverse=True)
     papers_to_process = sorted_papers[:max_papers]
-    logger.info(f"收到 {len(papers)} 篇论文，将解读热度最高的 {len(papers_to_process)} 篇。")
+    logger.info(f"共找到 {len(papers)} 篇论文，将解读热度最高的 {len(papers_to_process)} 篇。")
     
-    # 2. 并发调用LLM进行解读
-    tasks = [interpret_paper_with_llm(p) for p in papers_to_process]
+    # 3. 并发调用LLM解读
+    tasks = [interpret_single_paper(p) for p in papers_to_process]
     interpretations = await asyncio.gather(*tasks)
 
-    # 3. 构建Markdown报告
-    report_parts = [f"# Daily Paper Report ({date.today().isoformat()})\n"]
-    report_parts.append(f"Top {len(papers_to_process)} papers from Hugging Face, sorted by upvotes.\n---")
-
+    # 4. 构建Markdown报告
+    report_parts = [f"# AI每日论文解读 ({date_str})\n"]
+    report_parts.append(f"精选Hugging Face上点赞数最高的 {len(papers_to_process)} 篇论文进行解读。\n---")
     for i, paper in enumerate(papers_to_process):
         report_parts.append(f"\n## {i+1}. {paper.title}\n")
-        report_parts.append(f"**Upvotes:** {paper.upvotes} | **Authors:** {', '.join(paper.authors)}\n")
-        report_parts.append(f"> [arXiv Link]({paper.arxiv_url}) | [Hugging Face Link]({paper.huggingface_url})\n")
-        report_parts.append("### LLM Interpretation\n")
+        report_parts.append(f"**点赞数:** {paper.upvotes} | **作者:** {', '.join(paper.authors)}\n")
+        report_parts.append(f"> [arXiv链接]({paper.arxiv_url}) | [Hugging Face链接]({paper.huggingface_url})\n")
+        report_parts.append("### 🤖 LLM 解读\n")
         report_parts.append(interpretations[i])
         report_parts.append("\n---")
+    
+    return MarkdownResponse(markdown_report="\n".join(report_parts))
 
-    final_report = "\n".join(report_parts)
-    return MarkdownResponse(markdown_report=final_report)
+@app.get(
+    "/papers",
+    response_model=List[Paper],
+    summary="仅获取指定日期的原始论文数据",
+    description="一个辅助接口，用于获取原始、未加工的论文数据列表。"
+)
+async def get_raw_papers(request_date: Optional[str] = Query(None, description="日期 (YYYY-MM-DD)，留空为今天。")):
+    target_date = date.today()
+    if request_date:
+        try:
+            target_date = date.fromisoformat(request_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式无效，请使用 'YYYY-MM-DD' 格式。")
+    return await scrape_papers_for_date(target_date.isoformat())
 
-
+# --- 7. 用于本地运行的入口 ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
