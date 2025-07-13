@@ -1,0 +1,2 @@
+# huggingface-paper
+一个基于FastAPI的爬取huggingface每日paper的服务
