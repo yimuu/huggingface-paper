@@ -10,5 +10,6 @@ dependencies = [
     "fastapi[standard]>=0.116.1",
     "httpx>=0.28.1",
     "lxml>=6.0.0",
+    "openai>=1.95.1",
     "python-dotenv>=1.1.1",
 ]

@@ -8,11 +8,12 @@ from typing import List, Optional
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi_cache import FastAPICache
 from fastapi_cache.backends.inmemory import InMemoryBackend
 from fastapi_cache.decorator import cache
 from pydantic import BaseModel, HttpUrl
+from openai import AsyncOpenAI, OpenAIError
 
 # --- 1. 配置 ---
 # 加载 .env 文件中的环境变量
@@ -29,6 +30,28 @@ logger = logging.getLogger(__name__)
 # 从环境变量获取缓存时间，如果没有则默认为12小时
 CACHE_EXPIRE_SECONDS = int(os.getenv("CACHE_EXPIRE_SECONDS", 43200))
 
+# --- OpenAI 配置 ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+
+# 全局 OpenAI 客户端
+openai_client: Optional[AsyncOpenAI] = None
+
+# --- LLM Prompt Template ---
+PROMPT_TEMPLATE = """
+你是一名顶级的AI研究员助手。你的任务是基于论文的标题和摘要，提供一份简洁而深刻的中文解读。
+
+**论文标题：** {title}
+**论文摘要：** {summary}
+
+请严格根据以上信息，生成一份包含以下两个部分的Markdown格式解读：
+1.  **核心贡献 (Contribution):** 清晰地阐述这篇论文最主要的创新点或发现。它解决了什么新问题，或者提出了什么新方法？
+2.  **方法简介 (Method):** 简要介绍论文中使用的核心方法、模型架构或技术路径。请尽量使用易于理解的语言，避免不必要的术语。
+
+请确保你的解读内容完全基于所提供的标题和摘要，并使用流畅的中文进行表述。
+"""
+
 
 # --- 2. Pydantic 数据模型 ---
 class Paper(BaseModel):
@@ -43,30 +66,44 @@ class Paper(BaseModel):
     ai_summary: Optional[str] = None
     ai_keywords: List[str] = []
 
+class PaperList(BaseModel):
+    """用于接收论文列表的请求体模型"""
+    papers: List[Paper]
+
+class MarkdownResponse(BaseModel):
+    """用于返回Markdown报告的响应体模型"""
+    markdown_report: str
+
 
 # --- 3. FastAPI 应用生命周期管理 (lifespan) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    管理应用的启动和关闭事件。
-    """
-    # --- 启动时执行 ---
+    global openai_client
     logger.info("Application is starting up...")
+    
     # 初始化缓存
     FastAPICache.init(InMemoryBackend(), prefix="fastapi-cache")
-    logger.info(f"Cache initialized with InMemoryBackend. Expire time: {CACHE_EXPIRE_SECONDS} seconds.")
+    logger.info(f"Cache initialized. Expire time: {CACHE_EXPIRE_SECONDS} seconds.")
 
+    # 初始化 OpenAI 客户端
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY not found in environment variables. The /interpret endpoint will not work.")
+    else:
+        openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        logger.info(f"OpenAI client initialized for model: {OPENAI_MODEL_NAME}")
+    
     yield
-
-    # --- 关闭时执行 ---
+    
     logger.info("Application is shutting down...")
+    if openai_client:
+        await openai_client.close()
 
 
 # --- 4. FastAPI 应用实例 ---
 app = FastAPI(
-    title="Hugging Face Daily Papers Scraper",
-    description="爬取Hugging Face每日论文。",
-    version="0.1.0",
+    title="Hugging Face Daily Papers Scraper & Interpreter",
+    description="一个API服务，用于爬取Hugging Face每日论文并使用LLM进行解读。",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -176,6 +213,46 @@ async def get_daily_papers(request_date: Optional[str] = None):
 
     logger.info(f"成功解析并处理了 {len(results)} 篇论文（日期: {date_str}）。")
     return results
+
+
+@app.post("/interpret", response_model=MarkdownResponse, summary="[步骤2] 对论文列表进行LLM解读并生成报告")
+async def interpret_papers(
+    paper_list: PaperList,
+    max_papers: int = Query(3, ge=1, le=10, description="要解读的论文最大数量，按点赞数排序。")
+):
+    """
+    接收一个论文列表，对其进行排序、筛选，并调用LLM进行解读，最后生成一份Markdown报告。
+    """
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="OpenAI客户端未配置，无法提供解读服务。请检查服务器配置。")
+        
+    papers = paper_list.papers
+    if not papers:
+        return MarkdownResponse(markdown_report="# Daily Paper Report\n\nNo papers provided to interpret.")
+
+    # 1. 按点赞数排序并筛选
+    sorted_papers = sorted(papers, key=lambda p: p.upvotes, reverse=True)
+    papers_to_process = sorted_papers[:max_papers]
+    logger.info(f"收到 {len(papers)} 篇论文，将解读热度最高的 {len(papers_to_process)} 篇。")
+    
+    # 2. 并发调用LLM进行解读
+    tasks = [interpret_paper_with_llm(p) for p in papers_to_process]
+    interpretations = await asyncio.gather(*tasks)
+
+    # 3. 构建Markdown报告
+    report_parts = [f"# Daily Paper Report ({date.today().isoformat()})\n"]
+    report_parts.append(f"Top {len(papers_to_process)} papers from Hugging Face, sorted by upvotes.\n---")
+
+    for i, paper in enumerate(papers_to_process):
+        report_parts.append(f"\n## {i+1}. {paper.title}\n")
+        report_parts.append(f"**Upvotes:** {paper.upvotes} | **Authors:** {', '.join(paper.authors)}\n")
+        report_parts.append(f"> [arXiv Link]({paper.arxiv_url}) | [Hugging Face Link]({paper.huggingface_url})\n")
+        report_parts.append("### LLM Interpretation\n")
+        report_parts.append(interpretations[i])
+        report_parts.append("\n---")
+
+    final_report = "\n".join(report_parts)
+    return MarkdownResponse(markdown_report=final_report)
 
 
 if __name__ == "__main__":
